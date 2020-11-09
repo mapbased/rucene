@@ -11,11 +11,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::codec::{codec_util, INT_BYTES, LONG_BYTES};
-use core::store::{DataOutput, Directory, IOContext, IndexInput, IndexOutput, IndexOutputRef};
+use core::codec::{footer_length, write_footer, INT_BYTES, LONG_BYTES};
+use core::store::directory::Directory;
+use core::store::io::{DataOutput, IndexInput, IndexOutput, IndexOutputRef};
+use core::store::IOContext;
 use core::util::bkd::{LongBitSet, PointReader, PointReaderEnum, PointType, PointWriter};
 use core::util::DocId;
+
 use error::{Error, ErrorKind::UnexpectedEOF, Result};
+use std::io::Read;
 use std::sync::Arc;
 
 pub struct OfflinePointReader {
@@ -52,7 +56,7 @@ impl OfflinePointReader {
             }
         }
 
-        let footer_length = codec_util::footer_length();
+        let footer_length = footer_length();
         let file_length = temp_dir.file_length(temp_file_name)?;
 
         if (start + length) * (bytes_per_doc as usize) + footer_length > file_length as usize {
@@ -108,23 +112,23 @@ impl OfflinePointReader {
 
     fn read_long(bytes: &[u8], pos: usize) -> i64 {
         let mut pos = pos;
-        let i1p1 = bytes[pos] as i32 & 0xFF;
+        let i1p1 = bytes[pos] as u32 as i32;
         pos += 1;
-        let i1p2 = bytes[pos] as i32 & 0xFF;
+        let i1p2 = bytes[pos] as u32 as i32;
         pos += 1;
-        let i1p3 = bytes[pos] as i32 & 0xFF;
+        let i1p3 = bytes[pos] as u32 as i32;
         pos += 1;
-        let i1p4 = bytes[pos] as i32 & 0xFF;
+        let i1p4 = bytes[pos] as u32 as i32;
         pos += 1;
         let i1 = i1p1 << 24 | i1p2 << 16 | i1p3 << 8 | i1p4;
 
-        let i2p1 = bytes[pos] as i32 & 0xFF;
+        let i2p1 = bytes[pos] as u32 as i32;
         pos += 1;
-        let i2p2 = bytes[pos] as i32 & 0xFF;
+        let i2p2 = bytes[pos] as u32 as i32;
         pos += 1;
-        let i2p3 = bytes[pos] as i32 & 0xFF;
+        let i2p3 = bytes[pos] as u32 as i32;
         pos += 1;
-        let i2p4 = bytes[pos] as i32 & 0xFF;
+        let i2p4 = bytes[pos] as u32 as i32;
         let i2 = i2p1 << 24 | i2p2 << 16 | i2p3 << 8 | i2p4;
 
         ((i1 as i64) << 32) | ((i2 as i64) & 0xFFFF_FFFFi64)
@@ -132,19 +136,15 @@ impl OfflinePointReader {
 
     fn read_int(bytes: &[u8], pos: usize) -> i32 {
         let mut pos = pos;
-        let i1p1 = bytes[pos] as i32 & 0xFF;
+        let i1p1 = bytes[pos] as u32 as i32;
         pos += 1;
-        let i1p2 = bytes[pos] as i32 & 0xFF;
+        let i1p2 = bytes[pos] as u32 as i32;
         pos += 1;
-        let i1p3 = bytes[pos] as i32 & 0xFF;
+        let i1p3 = bytes[pos] as u32 as i32;
         pos += 1;
-        let i1p4 = bytes[pos] as i32 & 0xFF;
+        let i1p4 = bytes[pos] as u32 as i32;
 
-        (i1p1 << 24 | i1p2 << 16 | i1p3 << 8 | i1p4)
-    }
-
-    pub fn close(&self) -> Result<()> {
-        Ok(())
+        i1p1 << 24 | i1p2 << 16 | i1p3 << 8 | i1p4
     }
 }
 
@@ -217,7 +217,7 @@ impl PointReader for OfflinePointReader {
                 self.input.read_int()? as i64
             };
 
-            debug_assert!(ord_bit_set.get(ord) == false);
+            debug_assert!(!ord_bit_set.get(ord));
             ord_bit_set.set(ord);
             fp += self.bytes_per_doc as i64;
         }
@@ -261,7 +261,7 @@ impl PointReader for OfflinePointReader {
             self.count_left -= count;
             let mut buffer = vec![0u8; bytes_per_doc];
             while count_start > 0 {
-                self.input.read_bytes(&mut buffer, 0, bytes_per_doc)?;
+                self.input.read_exact(&mut buffer)?;
                 let ord = if self.long_ords {
                     OfflinePointReader::read_long(&buffer, packed_bytes_length + INT_BYTES as usize)
                 } else if self.single_value_per_doc {
@@ -310,6 +310,7 @@ pub struct OfflinePointWriter<D: Directory> {
 }
 
 impl<D: Directory> OfflinePointWriter<D> {
+    #[allow(dead_code)]
     pub fn new(
         temp_dir: Arc<D>,
         name: String,
@@ -380,6 +381,7 @@ impl<D: Directory> OfflinePointWriter<D> {
 
 impl<D: Directory> PointWriter for OfflinePointWriter<D> {
     type IndexOutput = IndexOutputRef<D::TempOutput>;
+    type PointReader = PointReaderEnum;
 
     fn append(&mut self, packed_value: &[u8], ord: i64, doc_id: DocId) -> Result<()> {
         debug_assert!(packed_value.len() == self.packed_bytes_length);
@@ -410,7 +412,7 @@ impl<D: Directory> PointWriter for OfflinePointWriter<D> {
         self.temp_dir.delete_file(&self.name)
     }
 
-    fn point_reader(&self, start: usize, length: usize) -> Result<PointReaderEnum> {
+    fn point_reader(&self, start: usize, length: usize) -> Result<Self::PointReader> {
         debug_assert!(self.closed);
         debug_assert!((start + length) as i64 <= self.count);
         debug_assert!(self.expected_count == 0 || self.count == self.expected_count);
@@ -430,8 +432,7 @@ impl<D: Directory> PointWriter for OfflinePointWriter<D> {
         &mut self,
         start: usize,
         length: usize,
-        _to_close: &mut Vec<PointReaderEnum>,
-    ) -> Result<&mut PointReaderEnum> {
+    ) -> Result<&mut Self::PointReader> {
         if self.shared_reader.is_none() {
             debug_assert!(start == 0 && length as i64 <= self.count);
             let shared_reader = PointReaderEnum::Offline(OfflinePointReader::new(
@@ -474,7 +475,7 @@ impl<D: Directory> PointWriter for OfflinePointWriter<D> {
         if !self.closed {
             debug_assert!(self.shared_reader.is_none());
             let output = self.output.as_mut().unwrap();
-            codec_util::write_footer(output)?;
+            write_footer(output)?;
             self.closed = true;
         }
 

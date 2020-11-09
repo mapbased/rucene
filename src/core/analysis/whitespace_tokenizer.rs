@@ -11,92 +11,78 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::analysis::char_buffer::CharacterBuffer;
-use core::analysis::TokenStream;
-use core::attribute::PositionIncrementAttribute;
-use core::attribute::TermToBytesRefAttribute;
-use core::attribute::{CharTermAttribute, OffsetAttribute};
+use core::analysis::{Token, TokenStream};
 
 use error::Result;
 
 use std::fmt;
 use std::io::Read;
 
-// NOTE: this length is length by byte, so it's different from Lucene's word length
-const MAX_WORD_LEN: usize = 511;
+use unicode_reader::CodePoints;
 
+// NOTE: this length is length by byte, so it's different from Lucene's word length
+const MAX_BYTES_LEN: usize = 511;
 const IO_BUFFER_SIZE: usize = 4096;
 
 /// A tokenizer that divides text at whitespace characters.
 ///
 /// Note: That definition explicitly excludes the non-breaking space.
 /// Adjacent sequences of non-Whitespace characters form tokens.
-pub struct WhitespaceTokenizer<R: Read> {
+pub struct WhitespaceTokenizer {
     offset: usize,
     buffer_index: usize,
     data_len: usize,
     final_offset: usize,
-    term_attr: CharTermAttribute,
-    offset_attr: OffsetAttribute,
-    position_attr: PositionIncrementAttribute,
+
+    token: Token,
     io_buffer: CharacterBuffer,
-    reader: R,
+    reader: Box<dyn Read>,
 }
 
-impl<R: Read> fmt::Debug for WhitespaceTokenizer<R> {
+impl fmt::Debug for WhitespaceTokenizer {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("WhitespaceTokenizer")
             .field("offset", &self.offset)
             .field("buffer_index", &self.buffer_index)
             .field("data_len", &self.data_len)
             .field("final_offset", &self.final_offset)
-            .field("term_attr", &self.term_attr)
-            .field("offset_attr", &self.offset_attr)
+            .field(
+                "term",
+                &String::from_utf8(self.token.term.clone()).unwrap_or("".to_string()),
+            )
+            .field("position", &self.token.position)
+            .field("start_offset", &self.token.start_offset)
+            .field("end_offset", &self.token.end_offset)
             .field("io_buffer", &self.io_buffer)
             .finish()
     }
 }
 
-impl<R: Read> WhitespaceTokenizer<R> {
-    pub fn new(reader: R) -> Self {
+impl WhitespaceTokenizer {
+    pub fn new(reader: Box<dyn Read>) -> Self {
         WhitespaceTokenizer {
             offset: 0,
             buffer_index: 0,
             data_len: 0,
             final_offset: 0,
-            term_attr: CharTermAttribute::new(),
-            offset_attr: OffsetAttribute::new(),
-            position_attr: PositionIncrementAttribute::new(),
+            token: Token::new(),
             io_buffer: CharacterBuffer::new(IO_BUFFER_SIZE),
             reader,
         }
     }
 
-    pub fn is_token_char(&self, c: char) -> bool {
-        !c.is_whitespace()
-    }
-
-    /// Called on each token character to normalize it before it is added to the
-    /// token. The default implementation does nothing. Subclasses may use this to,
-    /// e.g., lowercase tokens.
-    #[allow(dead_code)]
-    fn normalize(&self, c: i32) -> i32 {
-        c
-    }
-
-    fn clear_attributes(&mut self) {
-        self.term_attr.clear();
-        self.offset_attr.clear();
-    }
-
-    fn correct_offset(&self, offset: usize) -> usize {
-        offset
+    pub fn push_char(&mut self, c: char) {
+        let char_len = c.len_utf8();
+        let term_len = self.token.term.len();
+        self.token.term.resize(term_len + char_len, 0u8);
+        c.encode_utf8(&mut self.token.term[term_len..]);
     }
 }
 
-impl<R: Read> TokenStream for WhitespaceTokenizer<R> {
-    fn increment_token(&mut self) -> Result<bool> {
-        self.clear_attributes();
+impl TokenStream for WhitespaceTokenizer {
+    fn next_token(&mut self) -> Result<bool> {
+        self.clear_token();
+
         let mut length = 0;
         let mut start = -1; // this variable is always initialized
         let mut end = -1;
@@ -109,7 +95,7 @@ impl<R: Read> TokenStream for WhitespaceTokenizer<R> {
                     if length > 0 {
                         break;
                     } else {
-                        self.final_offset = self.correct_offset(self.offset);
+                        self.final_offset = self.offset;
                         return Ok(false);
                     }
                 }
@@ -119,7 +105,7 @@ impl<R: Read> TokenStream for WhitespaceTokenizer<R> {
 
             let cur_char = self.io_buffer.char_at(self.buffer_index);
             self.buffer_index += 1;
-            if self.is_token_char(cur_char) {
+            if !cur_char.is_whitespace() {
                 if length == 0 {
                     debug_assert_eq!(start, -1);
                     start = (self.offset + self.buffer_index - 1) as isize;
@@ -127,8 +113,8 @@ impl<R: Read> TokenStream for WhitespaceTokenizer<R> {
                 }
                 end += 1;
                 length += cur_char.len_utf8();
-                self.term_attr.push_char(cur_char);
-                if self.term_attr.len() >= MAX_WORD_LEN {
+                self.push_char(cur_char);
+                if self.token.term.len() >= MAX_BYTES_LEN {
                     break;
                 }
             } else if length > 0 {
@@ -137,16 +123,16 @@ impl<R: Read> TokenStream for WhitespaceTokenizer<R> {
         }
 
         assert_ne!(start, -1);
-        let final_start = self.correct_offset(start as usize);
-        let final_end = self.correct_offset(end as usize);
-        self.final_offset = final_end;
-        self.offset_attr.set_offset(final_start, final_end)?;
+
+        self.final_offset = end as usize;
+        self.token.set_offset(start as usize, end as usize)?;
+
         Ok(true)
     }
 
     fn end(&mut self) -> Result<()> {
-        self.offset_attr.end();
-        self.term_attr.end();
+        self.end_token();
+
         Ok(())
     }
 
@@ -159,24 +145,68 @@ impl<R: Read> TokenStream for WhitespaceTokenizer<R> {
         Ok(())
     }
 
-    fn offset_attribute_mut(&mut self) -> &mut OffsetAttribute {
-        &mut self.offset_attr
+    fn token(&self) -> &Token {
+        &self.token
     }
 
-    fn offset_attribute(&self) -> &OffsetAttribute {
-        &self.offset_attr
+    fn token_mut(&mut self) -> &mut Token {
+        &mut self.token
+    }
+}
+
+/// a simple IO buffer to use
+#[derive(Debug)]
+pub struct CharacterBuffer {
+    pub buffer: Vec<char>,
+    pub offset: usize,
+    pub length: usize,
+}
+
+impl CharacterBuffer {
+    pub fn new(buffer_size: usize) -> Self {
+        if buffer_size < 2 {
+            panic!("buffer size must be >= 2");
+        }
+        CharacterBuffer {
+            buffer: vec!['\0'; buffer_size],
+            offset: 0,
+            length: 0,
+        }
     }
 
-    fn position_attribute_mut(&mut self) -> &mut PositionIncrementAttribute {
-        &mut self.position_attr
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
     }
 
-    fn term_bytes_attribute_mut(&mut self) -> &mut TermToBytesRefAttribute {
-        &mut self.term_attr
+    pub fn char_at(&self, index: usize) -> char {
+        debug_assert!(index < self.buffer.len());
+        self.buffer[index]
     }
 
-    fn term_bytes_attribute(&self) -> &TermToBytesRefAttribute {
-        &self.term_attr
+    pub fn reset(&mut self) {
+        self.offset = 0;
+        self.length = 0;
+    }
+
+    pub fn fill<T: Read + ?Sized>(&mut self, reader: &mut T) -> Result<bool> {
+        let mut unicode_reader = CodePoints::from(reader);
+        self.offset = 0;
+        let mut offset = 0;
+
+        loop {
+            if offset >= self.buffer.len() {
+                break;
+            }
+            if let Some(res) = unicode_reader.next() {
+                let cur_char = res?;
+                self.buffer[offset] = cur_char;
+                offset += 1;
+            } else {
+                break;
+            }
+        }
+        self.length = offset;
+        Ok(self.buffer.len() == self.length)
     }
 }
 
@@ -200,20 +230,17 @@ mod tests {
             (38, 41),
         ];
         let words: Vec<&str> = source.split(" ").collect();
-        let reader = BufReader::new(source.as_bytes());
+        let reader = Box::new(BufReader::new(source.as_bytes()));
 
         let mut tokenizer = WhitespaceTokenizer::new(reader);
 
         for i in 0..9 {
-            let res = tokenizer.increment_token(); // Ok(true)
+            let res = tokenizer.next_token(); // Ok(true)
             assert!(res.is_ok());
             assert!(res.unwrap());
-            assert_eq!(tokenizer.offset_attribute().start_offset(), offsets[i].0);
-            assert_eq!(tokenizer.offset_attribute().end_offset(), offsets[i].1);
-            assert_eq!(
-                tokenizer.term_bytes_attribute().get_bytes_ref().bytes(),
-                words[i].as_bytes()
-            );
+            assert_eq!(tokenizer.token().start_offset, offsets[i].0);
+            assert_eq!(tokenizer.token().end_offset, offsets[i].1);
+            assert_eq!(tokenizer.token().term.as_slice(), words[i].as_bytes());
         }
     }
 }

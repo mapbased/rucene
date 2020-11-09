@@ -11,8 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::index::PointValues;
-use core::index::Terms;
+use core::codec::points::PointValues;
+use core::codec::Terms;
 use core::search::{DocIterator, NO_MORE_DOCS};
 use core::util::bit_set::{BitSet, FixedBitSet};
 use core::util::bit_util::{BitsRequired, UnsignedShift};
@@ -32,8 +32,6 @@ use std::sync::Arc;
 /// To add documents, you first need to call {@link #grow} in order to reserve
 /// space, and then call `BulkAdder#add(int)` on the returned
 /// `BulkAdder`.
-///
-/// @lucene.internal
 pub struct DocIdSetBuilder {
     max_doc: DocId,
     threshold: usize,
@@ -98,7 +96,7 @@ impl DocIdSetBuilder {
     /// Add the content of the provided `DocIterator` to this builder.
     /// NOTE: if you need to build a `DocIdSet` out of a single
     /// `DocIterator`, you should rather use `RoaringDocIdSet.Builder`.
-    pub fn add(&mut self, iter: &mut DocIterator) -> Result<()> {
+    pub fn add(&mut self, iter: &mut dyn DocIterator) -> Result<()> {
         if let Some(ref mut bit_set) = self.bit_set {
             bit_set.or(iter)?;
         } else {

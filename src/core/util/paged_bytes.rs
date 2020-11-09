@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::store::{DataInput, DataOutput, IndexInput};
+use core::store::io::{DataInput, DataOutput, IndexInput};
 use core::util::BytesRef;
 
 use error::{
@@ -356,8 +356,7 @@ impl PagedBytesReader {
             let length = block[offset] as usize;
             block[offset + 1..offset + 1 + length].to_vec()
         } else {
-            let length =
-                ((block[offset] as usize & 0x7f) << 8) | (block[offset + 1] as usize & 0xff);
+            let length = ((block[offset] as usize & 0x7f) << 8) | (block[offset + 1] as usize);
             let end = offset + 2 + length;
             block[offset + 2..end].to_vec()
         }

@@ -11,28 +11,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BinaryHeap;
+use std::collections::binary_heap::BinaryHeap;
 use std::f32;
+use std::mem;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::usize;
 
 use core::codec::Codec;
-use core::index::LeafReaderContext;
+use core::index::reader::LeafReaderContext;
 use core::search::collector::{Collector, ParallelLeafCollector, SearchCollector};
-use core::search::top_docs::{ScoreDoc, ScoreDocHit, TopDocs, TopScoreDocs};
-use core::search::Scorer;
+use core::search::scorer::Scorer;
+use core::search::sort_field::{ScoreDoc, ScoreDocHit, TopDocs, TopScoreDocs};
 use core::util::DocId;
-use error::{ErrorKind::IllegalState, Result};
+use error::{ErrorKind::IllegalState, Result, ResultExt};
 
-use crossbeam::channel::{unbounded, Receiver, Sender};
-
-type ScoreDocPriorityQueue = BinaryHeap<ScoreDoc>;
-
-pub struct TopDocsCollector {
+struct TopDocsBaseCollector {
     /// The priority queue which holds the top documents. Note that different
     /// implementations of PriorityQueue give different meaning to 'top documents'.
     /// HitQueue for example aggregates the top scoring documents, while other PQ
     /// implementations may hold documents sorted by other criteria.
-    pq: ScoreDocPriorityQueue,
+    pq: BinaryHeap<ScoreDoc>,
 
     estimated_hits: usize,
 
@@ -40,25 +38,21 @@ pub struct TopDocsCollector {
     total_hits: usize,
 
     cur_doc_base: DocId,
-
-    // TODO used for parallel collect, maybe should be move the new struct for parallel search
-    channel: Option<(Sender<ScoreDoc>, Receiver<ScoreDoc>)>,
 }
 
-impl TopDocsCollector {
-    pub fn new(estimated_hits: usize) -> TopDocsCollector {
-        let pq = ScoreDocPriorityQueue::with_capacity(estimated_hits);
-        TopDocsCollector {
+impl TopDocsBaseCollector {
+    fn new(estimated_hits: usize) -> Self {
+        let pq = BinaryHeap::with_capacity(estimated_hits);
+        Self {
             pq,
             estimated_hits,
             total_hits: 0,
             cur_doc_base: 0,
-            channel: None,
         }
     }
 
     /// Returns the top docs that were collected by this collector.
-    pub fn top_docs(&mut self) -> TopDocs {
+    fn top_docs(&mut self) -> TopDocs {
         let size = self.total_hits.min(self.pq.len());
         let mut score_docs = Vec::with_capacity(size);
 
@@ -71,13 +65,7 @@ impl TopDocsCollector {
     }
 
     fn add_doc(&mut self, doc_id: DocId, score: f32) {
-        debug_assert!(self.pq.len() <= self.estimated_hits);
-
-        self.total_hits += 1;
-
-        let at_capacity = self.pq.len() == self.estimated_hits;
-
-        if !at_capacity {
+        if self.pq.len() < self.estimated_hits {
             let score_doc = ScoreDoc::new(doc_id, score);
             self.pq.push(score_doc);
         } else if let Some(mut doc) = self.pq.peek_mut() {
@@ -88,11 +76,58 @@ impl TopDocsCollector {
     }
 }
 
+impl Collector for TopDocsBaseCollector {
+    fn needs_scores(&self) -> bool {
+        true
+    }
+
+    fn collect<S: Scorer + ?Sized>(&mut self, doc: i32, scorer: &mut S) -> Result<()> {
+        let score = scorer.score()?;
+        debug_assert!((score - f32::NEG_INFINITY).abs() >= f32::EPSILON);
+        debug_assert!(!score.is_nan());
+
+        let id = doc + self.cur_doc_base;
+        self.add_doc(id, score);
+        self.total_hits += 1;
+
+        Ok(())
+    }
+}
+
+pub struct TopDocsCollector {
+    /// The priority queue which holds the top documents. Note that different
+    /// implementations of PriorityQueue give different meaning to 'top documents'.
+    /// HitQueue for example aggregates the top scoring documents, while other PQ
+    /// implementations may hold documents sorted by other criteria.
+    base: TopDocsBaseCollector,
+
+    channel: Option<(Sender<LeafTopDocs>, Receiver<LeafTopDocs>)>,
+}
+
+impl TopDocsCollector {
+    pub fn new(estimated_hits: usize) -> Self {
+        let base = TopDocsBaseCollector::new(estimated_hits);
+        Self {
+            base,
+            channel: None,
+        }
+    }
+
+    /// Returns the top docs that were collected by this collector.
+    pub fn top_docs(&mut self) -> TopDocs {
+        self.base.top_docs()
+    }
+
+    fn add_doc(&mut self, doc_id: DocId, score: f32) {
+        self.base.add_doc(doc_id, score)
+    }
+}
+
 impl SearchCollector for TopDocsCollector {
     type LC = TopDocsLeafCollector;
 
     fn set_next_reader<C: Codec>(&mut self, reader: &LeafReaderContext<'_, C>) -> Result<()> {
-        self.cur_doc_base = reader.doc_base;
+        self.base.cur_doc_base = reader.doc_base;
 
         Ok(())
     }
@@ -101,15 +136,20 @@ impl SearchCollector for TopDocsCollector {
         true
     }
 
+    fn init_parallel(&mut self) {
+        if self.channel.is_none() {
+            self.channel = Some(channel());
+        }
+    }
+
     fn leaf_collector<C: Codec>(
-        &mut self,
+        &self,
         reader: &LeafReaderContext<'_, C>,
     ) -> Result<TopDocsLeafCollector> {
-        if self.channel.is_none() {
-            self.channel = Some(unbounded());
-        }
+        let mut collector = TopDocsBaseCollector::new(self.base.estimated_hits);
+        collector.cur_doc_base = reader.doc_base;
         Ok(TopDocsLeafCollector::new(
-            reader.doc_base,
+            collector,
             self.channel.as_ref().unwrap().0.clone(),
         ))
     }
@@ -120,8 +160,11 @@ impl SearchCollector for TopDocsCollector {
         // inited and thus stay None
         if let Some((sender, receiver)) = channel {
             drop(sender);
-            while let Ok(doc) = receiver.recv() {
-                self.add_doc(doc.doc, doc.score)
+            while let Ok(docs) = receiver.recv() {
+                self.base.total_hits += docs.total_hits;
+                for doc in docs.docs {
+                    self.add_doc(doc.doc, doc.score);
+                }
             }
         }
 
@@ -135,32 +178,38 @@ impl Collector for TopDocsCollector {
     }
 
     fn collect<S: Scorer + ?Sized>(&mut self, doc: DocId, scorer: &mut S) -> Result<()> {
-        let score = scorer.score()?;
-        debug_assert!((score - f32::NEG_INFINITY).abs() >= f32::EPSILON);
-        debug_assert!(!score.is_nan());
-
-        let id = doc + self.cur_doc_base;
-        self.add_doc(id, score);
-
-        Ok(())
+        self.base.collect(doc, scorer)
     }
 }
 
+struct LeafTopDocs {
+    docs: Vec<ScoreDoc>,
+    total_hits: usize,
+}
+
 pub struct TopDocsLeafCollector {
-    doc_base: DocId,
-    channel: Sender<ScoreDoc>,
+    collector: TopDocsBaseCollector,
+    channel: Sender<LeafTopDocs>,
 }
 
 impl TopDocsLeafCollector {
-    pub fn new(doc_base: DocId, channel: Sender<ScoreDoc>) -> TopDocsLeafCollector {
-        TopDocsLeafCollector { doc_base, channel }
+    fn new(collector: TopDocsBaseCollector, channel: Sender<LeafTopDocs>) -> TopDocsLeafCollector {
+        Self { collector, channel }
     }
 }
 
 impl ParallelLeafCollector for TopDocsLeafCollector {
     /// may do clean up and notify parent that leaf is ended
     fn finish_leaf(&mut self) -> Result<()> {
-        Ok(())
+        let docs = mem::replace(&mut self.collector.pq, BinaryHeap::new());
+        let top_docs = LeafTopDocs {
+            // the doc is not sorted, but this is ok.
+            docs: docs.into_vec(),
+            total_hits: self.collector.total_hits,
+        };
+        self.channel
+            .send(top_docs)
+            .chain_err(|| IllegalState("channel unexpected closed before search complete".into()))
     }
 }
 
@@ -170,14 +219,7 @@ impl Collector for TopDocsLeafCollector {
     }
 
     fn collect<S: Scorer + ?Sized>(&mut self, doc: i32, scorer: &mut S) -> Result<()> {
-        let score_doc = ScoreDoc::new(doc + self.doc_base, scorer.score()?);
-        self.channel.send(score_doc).map_err(|e| {
-            IllegalState(format!(
-                "channel unexpected closed before search complete with err: {:?}",
-                e
-            ))
-            .into()
-        })
+        self.collector.collect(doc, scorer)
     }
 }
 
@@ -186,8 +228,8 @@ mod tests {
     use super::*;
     use core::search::tests::*;
 
+    use core::index::reader::IndexReader;
     use core::index::tests::*;
-    use core::index::IndexReader;
     use core::search::*;
 
     #[test]

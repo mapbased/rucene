@@ -28,13 +28,16 @@ mod direct_writer;
 pub use self::direct_writer::*;
 
 mod monotonic_block_packed_reader;
-pub(crate) use self::monotonic_block_packed_reader::*;
+
+pub use self::monotonic_block_packed_reader::*;
 
 mod monotonic_block_packed_writer;
 
 pub use self::monotonic_block_packed_writer::*;
 
-pub mod packed_misc;
+mod packed_misc;
+
+pub use self::packed_misc::*;
 
 mod packed_ints_null_reader;
 
@@ -51,3 +54,15 @@ pub use self::packed_long_values::*;
 mod block_packed_writer;
 
 pub use self::block_packed_writer::*;
+
+mod elias_fano_encoder;
+
+pub use self::elias_fano_encoder::*;
+
+mod elias_fano_decoder;
+
+pub use self::elias_fano_decoder::*;
+
+mod packed_simd;
+
+pub use self::packed_simd::*;

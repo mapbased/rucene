@@ -11,21 +11,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod bytes_output;
+
+pub use self::bytes_output::*;
+
+mod bytes_store;
+
+pub use self::bytes_store::*;
+
+mod fst_builder;
+
+pub use self::fst_builder::*;
+
+mod fst_iteartor;
+
+pub use self::fst_iteartor::*;
+
+mod fst_reader;
+
+pub use self::fst_reader::*;
+
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::io;
 
-use core::store::{DataInput, DataOutput};
+use core::store::io::{DataInput, DataOutput};
 use error::Result;
-
-// pub mod builder;
-pub mod bytes_output;
-pub use self::bytes_output::{ByteSequenceOutput, ByteSequenceOutputFactory};
-pub mod bytes_store;
-pub mod fst_builder;
-pub mod fst_iteartor;
-pub mod fst_reader;
-pub use self::fst_reader::*;
 
 pub trait Output: Clone + Eq + Hash + Debug {
     type Value;
@@ -156,7 +167,7 @@ impl io::Read for DirectionalBytesReader {
             if available < len {
                 len = available;
             }
-            b[..len].clone_from_slice(&self.bytes_slice()[self.pos..len]);
+            b[..len].copy_from_slice(&self.bytes_slice()[self.pos..len]);
 
             self.pos += len;
         }
@@ -235,15 +246,12 @@ pub mod tests {
 
     impl Read for TestBufferedDataIO {
         fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
-            let left = b.len();
-
-            for b in b.iter_mut().take(left) {
-                if let Ok(byte) = self.read_byte() {
-                    *b = byte;
-                }
+            let len = b.len().min(self.bytes.len() - self.read);
+            if len > 0 {
+                b[..len].copy_from_slice(&self.bytes[self.read..self.read + len]);
+                self.read += len;
             }
-
-            Ok(b.len() - left)
+            Ok(len)
         }
     }
 }

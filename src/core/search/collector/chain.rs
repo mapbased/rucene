@@ -12,9 +12,9 @@
 // limitations under the License.
 
 use core::codec::Codec;
-use core::index::LeafReaderContext;
+use core::index::reader::LeafReaderContext;
 use core::search::collector::{Collector, ParallelLeafCollector, SearchCollector};
-use core::search::Scorer;
+use core::search::scorer::Scorer;
 use core::util::DocId;
 use error::Result;
 
@@ -47,8 +47,13 @@ where
         self.first.support_parallel() && self.second.support_parallel()
     }
 
+    fn init_parallel(&mut self) {
+        self.first.init_parallel();
+        self.second.init_parallel();
+    }
+
     fn leaf_collector<C: Codec>(
-        &mut self,
+        &self,
         reader: &LeafReaderContext<'_, C>,
     ) -> Result<ChainedCollector<A::LC, B::LC>> {
         Ok(ChainedCollector {

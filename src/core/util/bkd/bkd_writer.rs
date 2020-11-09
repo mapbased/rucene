@@ -11,22 +11,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::codec::codec_util;
-use core::codec::MutablePointsReader;
+use core::codec::points::MutablePointsReader;
+use core::codec::points::{IntersectVisitor, Relation};
+use core::codec::write_header;
 use core::codec::{INT_BYTES, LONG_BYTES};
-use core::index::{IntersectVisitor, LiveDocsDocMap, Relation};
-use core::store::{
-    DataOutput, Directory, GrowableByteArrayDataOutput, IndexOutput, RAMOutputStream,
-    TrackingDirectoryWrapper,
-};
+use core::index::merge::LiveDocsDocMap;
+use core::store::directory::{Directory, TrackingDirectoryWrapper};
+use core::store::io::{DataOutput, GrowableByteArrayDataOutput, IndexOutput, RAMOutputStream};
 use core::util::bit_set::{BitSet, FixedBitSet, ImmutableBitSet};
 use core::util::bit_util::UnsignedShift;
 use core::util::bkd::{
     bkd_reader::{MergeReader, StubIntersectVisitor},
     BKDReader, DocIdsWriter, HeapPointWriter, LongBitSet, MutablePointsReaderUtils,
-    OfflinePointWriter, PointReader, PointReaderEnum, PointType, PointWriter, PointWriterEnum,
+    OfflinePointWriter, PointReader, PointType, PointWriter, PointWriterEnum,
 };
-use core::util::offline_sorter::{BufferSize, MAX_TEMP_FILES};
 use core::util::sorter::{check_range, MSBRadixSorter, MSBSorter, Sorter};
 use core::util::string_util::bytes_subtract;
 use core::util::DocId;
@@ -52,7 +50,7 @@ pub const DEFAULT_MAX_POINTS_IN_LEAF_NODE: i32 = 1024;
 pub const DEFAULT_MAX_MB_SORT_IN_HEAP: f32 = 1024.0f32;
 pub const MAX_DIMS: i32 = 8;
 
-pub struct PathSlice<W: PointWriter> {
+struct PathSlice<W: PointWriter> {
     writer: W,
     start: i64,
     count: i64,
@@ -159,7 +157,7 @@ impl<'a, D: Directory, O: IndexOutput> OneDimensionBKDWriter<'a, D, O> {
                 &self.last_packed_value,
                 packed_value,
                 doc_id,
-                self.last_doc_id
+                self.last_doc_id,
             )
             .is_ok());
 
@@ -264,7 +262,7 @@ impl<'a, D: Directory, O: IndexOutput> OneDimensionBKDWriter<'a, D, O> {
         bkd_writer.common_prefix_lengths[0] = prefix;
         debug_assert!(bkd_writer.scratch_out.position() == 0);
 
-        let scratch_out = (&mut bkd_writer.scratch_out) as (*mut GrowableByteArrayDataOutput);
+        let scratch_out = (&mut bkd_writer.scratch_out) as *mut GrowableByteArrayDataOutput;
         let common_prefix_lengths: *mut [usize] = bkd_writer.common_prefix_lengths.as_mut();
 
         bkd_writer.write_leaf_block_docs(
@@ -342,8 +340,6 @@ pub struct BKDWriter<D: Directory> {
 
     single_value_per_doc: bool,
 
-    _offline_sorter_buffer_mb: BufferSize,
-    _offline_sorter_max_temp_files: i32,
     max_doc: i32,
 
     min_packed_value: Vec<u8>,
@@ -419,8 +415,6 @@ impl<D: Directory> BKDWriter<D> {
             single_value_per_doc,
         );
 
-        let _offline_sorter_buffer_mb =
-            BufferSize::megabytes(max_mb_sort_in_heap.max(1.0f64) as i32)?;
         Ok(BKDWriter {
             _bytes_per_doc: bytes_per_doc,
             num_dims,
@@ -443,8 +437,6 @@ impl<D: Directory> BKDWriter<D> {
             total_point_count,
             long_ords,
             single_value_per_doc,
-            _offline_sorter_buffer_mb,
-            _offline_sorter_max_temp_files: MAX_TEMP_FILES,
             max_doc,
             min_packed_value: vec![0u8; packed_bytes_length],
             max_packed_value: vec![0u8; packed_bytes_length],
@@ -608,7 +600,6 @@ impl<D: Directory> BKDWriter<D> {
         // Sort all docs once by each dimension:
         let mut sorted_point_writers: Vec<PathSlice<PointWriterEnum<D>>> = vec![];
         // This is only used on exception; on normal code paths we close all files we opened:
-        let mut to_close_heroically = vec![];
         let mut _success = false;
 
         for dim in 0..self.num_dims {
@@ -624,8 +615,8 @@ impl<D: Directory> BKDWriter<D> {
             self.heap_point_writer = None;
         }
 
-        let min_packed_value = (&mut self.min_packed_value) as (*mut Vec<u8>);
-        let max_packed_value = (&mut self.max_packed_value) as (*mut Vec<u8>);
+        let min_packed_value = (&mut self.min_packed_value) as *mut Vec<u8>;
+        let max_packed_value = (&mut self.max_packed_value) as *mut Vec<u8>;
         let mut parent_splits: Vec<i32> = vec![0i32; self.num_dims as usize];
         self.build(
             1,
@@ -638,7 +629,6 @@ impl<D: Directory> BKDWriter<D> {
             &mut parent_splits,
             &mut split_packed_values,
             &mut leaf_block_fps,
-            &mut to_close_heroically,
         )?;
 
         for slice in &mut sorted_point_writers {
@@ -782,7 +772,7 @@ impl<D: Directory> BKDWriter<D> {
         );
 
         let mut one_dim_writer = OneDimensionBKDWriter::new(out, self)?;
-        let one_dim_writer_ptr = (&mut one_dim_writer) as (*mut OneDimensionBKDWriter<D, O>);
+        let one_dim_writer_ptr = (&mut one_dim_writer) as *mut OneDimensionBKDWriter<D, O>;
         let mut visitor = OneDimIntersectVisitor::new(unsafe { &mut (*one_dim_writer_ptr) });
         reader.intersect(field_name, &mut visitor)?;
 
@@ -979,8 +969,8 @@ impl<D: Directory> BKDWriter<D> {
 
             let mut first_diff_byte_delta: i32;
             if prefix < self.bytes_per_dim {
-                first_diff_byte_delta = (split_packed_values[address + prefix] as i32 & 0xFF)
-                    - (last_split_values[(split_dim * self.bytes_per_dim + prefix)] as i32 & 0xFF);
+                first_diff_byte_delta = (split_packed_values[address + prefix] as u32 as i32)
+                    - (last_split_values[(split_dim * self.bytes_per_dim + prefix)] as u32 as i32);
                 if negative_deltas[split_dim] {
                     first_diff_byte_delta *= -1;
                 }
@@ -1119,7 +1109,7 @@ impl<D: Directory> BKDWriter<D> {
         num_leaves: i32,
         packed_index: &[u8],
     ) -> Result<()> {
-        codec_util::write_header(out, CODEC_NAME, VERSION_CURRENT)?;
+        write_header(out, CODEC_NAME, VERSION_CURRENT)?;
 
         out.write_vint(self.num_dims as i32)?;
         out.write_vint(self.max_points_in_leaf_node)?;
@@ -1316,7 +1306,7 @@ impl<D: Directory> BKDWriter<D> {
                     &last_packed_value,
                     values[i],
                     docs[i],
-                    last_doc
+                    last_doc,
                 )
                 .is_ok());
 
@@ -1368,7 +1358,6 @@ impl<D: Directory> BKDWriter<D> {
         parent_splits: &mut Vec<i32>,
         split_packed_values: &mut Vec<u8>,
         leaf_block_fps: &mut Vec<i64>,
-        to_close_heroically: &mut Vec<PointReaderEnum>,
     ) -> Result<()> {
         for slice in slices.iter() {
             debug_assert!(slice.count == slices[0].count);
@@ -1379,7 +1368,7 @@ impl<D: Directory> BKDWriter<D> {
             && slices[0].count <= self.max_points_sort_in_heap as i64
         {
             // Special case for 1D, to cutover to heap once we recurse deeply enough:
-            let p = self.switch_to_heap(&mut slices[0], to_close_heroically)?;
+            let p = self.switch_to_heap(&mut slices[0])?;
             slices[0] = p;
         }
 
@@ -1396,7 +1385,7 @@ impl<D: Directory> BKDWriter<D> {
                     // Adversarial cases can cause this, e.g. very lopsided data, all equal points,
                     // such that we started offline, but then kept splitting
                     // only in one dimension, and so never had to rewrite into heap writer
-                    let p = self.switch_to_heap(&mut slices[dim], to_close_heroically)?;
+                    let p = self.switch_to_heap(&mut slices[dim])?;
                     slices[dim] = p;
                 }
 
@@ -1464,7 +1453,7 @@ impl<D: Directory> BKDWriter<D> {
             // like how terms dict does so from the FST:
 
             // Write the common prefixes:
-            let scratch1 = (&mut self.scratch1) as (*mut Vec<u8>);
+            let scratch1 = (&mut self.scratch1) as *mut Vec<u8>;
             self.write_common_prefixes(out, &self.common_prefix_lengths, unsafe {
                 &mut (*scratch1)
             })?;
@@ -1502,8 +1491,8 @@ impl<D: Directory> BKDWriter<D> {
         } else {
             // Inner node: partition/recurse
             let split_dim = if self.num_dims > 1 {
-                let min_packed_value = (&self.min_packed_value) as (*const Vec<u8>);
-                let max_packed_value = (&self.max_packed_value) as (*const Vec<u8>);
+                let min_packed_value = (&self.min_packed_value) as *const Vec<u8>;
+                let max_packed_value = (&self.max_packed_value) as *const Vec<u8>;
                 self.split(
                     unsafe { &(*min_packed_value) },
                     unsafe { &(*max_packed_value) },
@@ -1513,7 +1502,7 @@ impl<D: Directory> BKDWriter<D> {
                 0
             };
 
-            let source = (&slices[split_dim]) as (*const PathSlice<PointWriterEnum<D>>);
+            let source = (&slices[split_dim]) as *const PathSlice<PointWriterEnum<D>>;
             let source = unsafe { &(*source) };
             debug_assert!((node_id as usize) < split_packed_values.len());
 
@@ -1576,11 +1565,9 @@ impl<D: Directory> BKDWriter<D> {
                 // file:
                 let dim_start = slices[dim].start as usize;
                 let dim_count = slices[dim].count as usize;
-                let reader = slices[dim].writer.shared_point_reader(
-                    dim_start,
-                    dim_count,
-                    to_close_heroically,
-                )?;
+                let reader = slices[dim]
+                    .writer
+                    .shared_point_reader(dim_start, dim_count)?;
 
                 let mut left_point_writer = self.point_writer(left_count, &format!("left{}", dim));
                 let mut right_point_writer =
@@ -1617,7 +1604,6 @@ impl<D: Directory> BKDWriter<D> {
                 parent_splits,
                 split_packed_values,
                 leaf_block_fps,
-                to_close_heroically,
             )?;
 
             for dim in 0..self.num_dims as usize {
@@ -1641,7 +1627,6 @@ impl<D: Directory> BKDWriter<D> {
                 parent_splits,
                 split_packed_values,
                 leaf_block_fps,
-                to_close_heroically,
             )?;
 
             for dim in 0..self.num_dims as usize {
@@ -1765,15 +1750,12 @@ impl<D: Directory> BKDWriter<D> {
     fn switch_to_heap<W: PointWriter>(
         &self,
         source: &mut PathSlice<W>,
-        to_close_heroically: &mut Vec<PointReaderEnum>,
     ) -> Result<PathSlice<PointWriterEnum<D>>> {
         let count = source.count;
         // Not inside the try because we don't want to close it here:
-        let reader = source.writer.shared_point_reader(
-            source.start as usize,
-            source.count as usize,
-            to_close_heroically,
-        )?;
+        let reader = source
+            .writer
+            .shared_point_reader(source.start as usize, source.count as usize)?;
 
         let mut writer = HeapPointWriter::new(
             count as usize,
@@ -1845,7 +1827,7 @@ impl<D: Directory> Drop for BKDWriter<D> {
     }
 }
 
-pub(crate) struct BKDWriterMSBIntroSorter<D: Directory> {
+pub struct BKDWriterMSBIntroSorter<D: Directory> {
     bkd_writer: *mut BKDWriter<D>,
     heap_writer: *mut HeapPointWriter,
     dim: i32,

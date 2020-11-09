@@ -14,29 +14,115 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Deref;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crossbeam::channel::{unbounded, Receiver, Sender};
 
-use core::codec::{Codec, CodecTermState};
-use core::index::LeafReaderContext;
-use core::index::{get_terms, IndexReader, SearchLeafReader};
-use core::index::{Term, TermContext, Terms};
-use core::search::bulk_scorer::BulkScorer;
-use core::search::cache_policy::{QueryCachingPolicy, UsageTrackingQueryCachingPolicy};
+use core::codec::postings::FieldsProducer;
+use core::codec::{Codec, Terms};
+use core::codec::{TermIterator, TermState};
+use core::doc::{IndexOptions, Term};
+use core::index::reader::{IndexReader, LeafReaderContext, LeafReaderContextPtr, SearchLeafReader};
+use core::search::cache::{
+    LRUQueryCache, QueryCache, QueryCachingPolicy, UsageTrackingQueryCachingPolicy,
+};
 use core::search::collector::{self, Collector, ParallelLeafCollector, SearchCollector};
 use core::search::explanation::Explanation;
-use core::search::match_all::{ConstantScoreQuery, MatchAllDocsQuery};
-use core::search::query_cache::{LRUQueryCache, QueryCache};
+use core::search::query::{ConstantScoreQuery, MatchAllDocsQuery, Query, TermQuery, Weight};
+use core::search::scorer::{BulkScorer, Scorer};
+use core::search::similarity::{
+    BM25Similarity, SimScorer, SimWeight, Similarity, SimilarityProducer,
+};
 use core::search::statistics::{CollectionStatistics, TermStatistics};
-use core::search::BM25Similarity;
-use core::search::TermQuery;
-use core::search::{Query, Scorer, Weight, NO_MORE_DOCS};
-use core::search::{SimScorer, SimWeight, Similarity, SimilarityProducer};
-use core::util::thread_pool::{DefaultContext, ThreadPool, ThreadPoolBuilder};
+use core::search::NO_MORE_DOCS;
+use core::util::external::{DefaultContext, ThreadPool, ThreadPoolBuilder};
 use core::util::{Bits, DocId, KeyedContext};
 
 use error::{Error, ErrorKind, Result};
+
+const MAX_DOCS_PER_SLICE: i32 = 250_000;
+const MAX_SEGMENTS_PER_SLICE: i32 = 20;
+const MIN_PARALLEL_SLICES: i32 = 3;
+
+const DEFAULT_DISMATCH_NEXT_LIMIT: usize = 500_000;
+
+pub struct TermContext<S: TermState> {
+    pub doc_freq: i32,
+    pub total_term_freq: i64,
+    pub states: Vec<(DocId, S)>,
+}
+
+impl<S: TermState> TermContext<S> {
+    pub fn new<TI, Tm, FP, C, IR>(reader: &IR) -> TermContext<S>
+    where
+        TI: TermIterator<TermState = S>,
+        Tm: Terms<Iterator = TI>,
+        FP: FieldsProducer<Terms = Tm> + Clone,
+        C: Codec<FieldsProducer = FP>,
+        IR: IndexReader<Codec = C> + ?Sized,
+    {
+        let doc_freq = 0;
+        let total_term_freq = 0;
+        let states = Vec::with_capacity(reader.leaves().len());
+        TermContext {
+            doc_freq,
+            total_term_freq,
+            states,
+        }
+    }
+
+    pub fn build<TI, Tm, FP, C, IR>(&mut self, reader: &IR, term: &Term) -> Result<()>
+    where
+        TI: TermIterator<TermState = S>,
+        Tm: Terms<Iterator = TI>,
+        FP: FieldsProducer<Terms = Tm> + Clone,
+        C: Codec<FieldsProducer = FP>,
+        IR: IndexReader<Codec = C> + ?Sized,
+    {
+        for reader in reader.leaves() {
+            if let Some(terms) = reader.reader.terms(&term.field)? {
+                let mut terms_enum = terms.iterator()?;
+                if terms_enum.seek_exact(&term.bytes)? {
+                    // TODO add TermStates if someone need it
+                    let doc_freq = terms_enum.doc_freq()?;
+                    let total_term_freq = terms_enum.total_term_freq()?;
+                    self.accumulate_statistics(doc_freq, total_term_freq as i64);
+                    self.states
+                        .push((reader.doc_base(), terms_enum.term_state()?));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn accumulate_statistics(&mut self, doc_freq: i32, total_term_freq: i64) {
+        self.doc_freq += doc_freq;
+        if self.total_term_freq >= 0 && total_term_freq >= 0 {
+            self.total_term_freq += total_term_freq
+        } else {
+            self.total_term_freq = -1
+        }
+    }
+
+    pub fn get_term_state<C: Codec>(&self, reader: &LeafReaderContext<'_, C>) -> Option<&S> {
+        for (doc_base, state) in &self.states {
+            if *doc_base == reader.doc_base {
+                return Some(state);
+            }
+        }
+        None
+    }
+
+    pub fn term_states(&self) -> HashMap<DocId, S> {
+        let mut term_states = HashMap::new();
+        for (doc_base, term_state) in &self.states {
+            term_states.insert(*doc_base, term_state.clone());
+        }
+
+        term_states
+    }
+}
 
 /// Implements search over a single IndexReader.
 ///
@@ -67,6 +153,8 @@ impl<C: Codec> SimilarityProducer<C> for DefaultSimilarityProducer {
     }
 }
 
+/// A search-time `Similarity` that does not make use of scoring factors
+/// and may be used when scores are not needed.
 pub struct NonScoringSimilarity;
 
 impl<C: Codec> Similarity<C> for NonScoringSimilarity {
@@ -87,7 +175,7 @@ impl fmt::Display for NonScoringSimilarity {
     }
 }
 
-pub struct NonScoringSimWeight;
+struct NonScoringSimWeight;
 
 impl<C: Codec> SimWeight<C> for NonScoringSimWeight {
     fn get_value_for_normalization(&self) -> f32 {
@@ -101,7 +189,7 @@ impl<C: Codec> SimWeight<C> for NonScoringSimWeight {
     }
 }
 
-pub struct NonScoringSimScorer;
+struct NonScoringSimScorer;
 
 impl SimScorer for NonScoringSimScorer {
     fn score(&mut self, _doc: i32, _freq: f32) -> Result<f32> {
@@ -113,29 +201,15 @@ impl SimScorer for NonScoringSimScorer {
     }
 }
 
-pub trait IndexSearcher<C: Codec>: SearchPlanBuilder<C> {
-    type Reader: IndexReader<Codec = C> + ?Sized;
-    fn reader(&self) -> &Self::Reader;
-
-    fn search<S>(&self, query: &dyn Query<C>, collector: &mut S) -> Result<()>
-    where
-        S: SearchCollector + ?Sized;
-
-    fn search_parallel<S>(&self, query: &dyn Query<C>, collector: &mut S) -> Result<()>
-    where
-        S: SearchCollector + ?Sized;
-
-    fn count(&self, query: &dyn Query<C>) -> Result<i32>;
-
-    fn explain(&self, query: &dyn Query<C>, doc: DocId) -> Result<Explanation>;
-}
-
+/// trait that used for build `Weight` and `Similarity` for `Query`.
 pub trait SearchPlanBuilder<C: Codec> {
+    /// num docs of the reader in searcher, same as IndexSearcher::reader()::num_docs()
     fn num_docs(&self) -> i32;
 
+    /// max doc of the reader in searcher, same as IndexSearcher::reader()::max_doc()
     fn max_doc(&self) -> i32;
 
-    /// Creates a {@link Weight} for the given query, potentially adding caching
+    /// Creates a `Weight` for the given query, potentially adding caching
     /// if possible and configured.
     fn create_weight(&self, query: &dyn Query<C>, needs_scores: bool)
         -> Result<Box<dyn Weight<C>>>;
@@ -152,17 +226,43 @@ pub trait SearchPlanBuilder<C: Codec> {
 
     fn similarity(&self, field: &str, needs_scores: bool) -> Box<dyn Similarity<C>>;
 
-    fn term_state(&self, term: &Term) -> Result<Arc<TermContext<CodecTermState<C>>>>;
+    fn term_statistics(&self, term: &Term) -> Result<TermStatistics>;
 
-    fn term_statistics(
-        &self,
-        term: Term,
-        context: &TermContext<CodecTermState<C>>,
-    ) -> TermStatistics;
-
-    fn collections_statistics(&self, field: &str) -> Result<CollectionStatistics>;
+    fn collections_statistics(&self, field: &str) -> Option<&CollectionStatistics>;
 }
 
+pub trait IndexSearcher<C: Codec>: SearchPlanBuilder<C> {
+    type Reader: IndexReader<Codec = C> + ?Sized;
+    fn reader(&self) -> &Self::Reader;
+
+    fn search<S>(&self, query: &dyn Query<C>, collector: &mut S) -> Result<()>
+    where
+        S: SearchCollector;
+
+    fn search_parallel<S>(&self, query: &dyn Query<C>, collector: &mut S) -> Result<()>
+    where
+        S: SearchCollector;
+
+    fn count(&self, query: &dyn Query<C>) -> Result<i32>;
+
+    fn explain(&self, query: &dyn Query<C>, doc: DocId) -> Result<Explanation>;
+}
+
+///  Implements search over a single IndexReader.
+///
+/// Applications usually need only call the inherited
+/// `search(Query,Collector)` method. For
+/// performance reasons, if your index is unchanging, you
+/// should share a single IndexSearcher instance across
+/// multiple searches instead of creating a new one
+/// per-search.  If your index has changed and you wish to
+/// see the changes reflected in searching, you should
+/// use `StandardDirectoryReader#openIfChanged()`
+/// to obtain a new reader and then create a new IndexSearcher from that.
+/// Also, for low-latency turnaround it's best to use a near-real-time
+/// reader ({@link DirectoryReader#open(IndexWriter)}).
+/// Once you have a new `IndexReader`, it's relatively
+/// cheap to create a new IndexSearcher from it.
 pub struct DefaultIndexSearcher<
     C: Codec,
     R: IndexReader<Codec = C> + ?Sized,
@@ -170,13 +270,19 @@ pub struct DefaultIndexSearcher<
     SP: SimilarityProducer<C>,
 > {
     reader: IR,
-    sim_producer: SP,
+    thread_pool: Option<Arc<ThreadPool<DefaultContext>>>,
+    // used for concurrent search - each slice holds a set of LeafReader's ord that
+    // executed within one thread.
+    leaf_ord_slices: Vec<Vec<usize>>,
+
     query_cache: Arc<dyn QueryCache<C>>,
     cache_policy: Arc<dyn QueryCachingPolicy<C>>,
-    collection_statistics: RwLock<HashMap<String, CollectionStatistics>>,
-    term_contexts: RwLock<HashMap<String, Arc<TermContext<CodecTermState<C>>>>>,
-    term_contexts_limit: usize,
-    thread_pool: Option<Arc<ThreadPool<DefaultContext>>>,
+
+    sim_producer: SP,
+    collection_statistics: HashMap<String, CollectionStatistics>,
+
+    // dismatch next limit to break.
+    next_limit: usize,
 }
 
 impl<C: Codec, R: IndexReader<Codec = C> + ?Sized, IR: Deref<Target = R>>
@@ -184,9 +290,9 @@ impl<C: Codec, R: IndexReader<Codec = C> + ?Sized, IR: Deref<Target = R>>
 {
     pub fn new(
         reader: IR,
-        term_contexts_limit: Option<usize>,
+        next_limit: Option<usize>,
     ) -> DefaultIndexSearcher<C, R, IR, DefaultSimilarityProducer> {
-        Self::with_similarity(reader, DefaultSimilarityProducer {}, term_contexts_limit)
+        Self::with_similarity(reader, DefaultSimilarityProducer {}, next_limit)
     }
 }
 
@@ -200,23 +306,59 @@ where
     pub fn with_similarity(
         reader: IR,
         sim_producer: SP,
-        term_contexts_limit: Option<usize>,
+        next_limit: Option<usize>,
     ) -> DefaultIndexSearcher<C, R, IR, SP> {
-        let term_contexts_limit = if term_contexts_limit.is_some() {
-            term_contexts_limit.unwrap()
-        } else {
-            1_000_000
-        };
+        let mut leaves = reader.leaves();
+        leaves.sort_by(|l1, l2| l2.reader.max_doc().cmp(&l1.reader.max_doc()));
+
+        let mut collection_statistics: HashMap<String, CollectionStatistics> = HashMap::new();
+
+        for leaf_reader in leaves.iter() {
+            for (field_name, field_info) in &leaf_reader.reader.field_infos().by_name {
+                // use top-max-doc segment instead.
+                if field_info.index_options == IndexOptions::Null
+                    || collection_statistics.contains_key(field_name)
+                {
+                    continue;
+                }
+
+                let mut doc_count = 0i32;
+                let mut sum_doc_freq = 0i64;
+                let mut sum_total_term_freq = 0i64;
+
+                if let Ok(Some(terms)) = leaf_reader.reader.terms(field_name) {
+                    if let Ok(dc) = terms.doc_count() {
+                        doc_count = dc;
+                    }
+                    if let Ok(s) = terms.sum_doc_freq() {
+                        sum_doc_freq = s;
+                    }
+                    if let Ok(s) = terms.sum_total_term_freq() {
+                        sum_total_term_freq = s;
+                    }
+                }
+                let field_stat = CollectionStatistics::new(
+                    field_name.clone(),
+                    leaf_reader.doc_base(),
+                    reader.max_doc() as i64,
+                    doc_count as i64,
+                    sum_total_term_freq,
+                    sum_doc_freq,
+                );
+
+                collection_statistics.insert(field_name.clone(), field_stat);
+            }
+        }
 
         DefaultIndexSearcher {
             reader,
             sim_producer,
             query_cache: Arc::new(LRUQueryCache::new(1000)),
             cache_policy: Arc::new(UsageTrackingQueryCachingPolicy::default()),
-            collection_statistics: RwLock::new(HashMap::new()),
-            term_contexts: RwLock::new(HashMap::with_capacity(term_contexts_limit * 2)),
-            term_contexts_limit,
+            collection_statistics,
             thread_pool: None,
+            leaf_ord_slices: vec![],
+            next_limit: next_limit.unwrap_or(DEFAULT_DISMATCH_NEXT_LIMIT),
         }
     }
 
@@ -226,12 +368,18 @@ where
             let thread_pool = ThreadPoolBuilder::with_default_factory("search".into())
                 .thread_count(num_threads)
                 .build();
-            self.thread_pool = Some(Arc::new(thread_pool));
+            self.set_thread_pool(Arc::new(thread_pool));
         }
     }
 
     pub fn set_thread_pool(&mut self, pool: Arc<ThreadPool<DefaultContext>>) {
         self.thread_pool = Some(pool);
+        self.leaf_ord_slices = Self::slice(
+            self.reader.leaves(),
+            MAX_DOCS_PER_SLICE,
+            MAX_SEGMENTS_PER_SLICE,
+            MIN_PARALLEL_SLICES,
+        );
     }
 
     pub fn set_query_cache(&mut self, cache: Arc<dyn QueryCache<C>>) {
@@ -242,13 +390,14 @@ where
         self.cache_policy = cache_policy;
     }
 
-    fn do_search<S: Scorer + ?Sized, T: Collector + ?Sized, B: Bits + ?Sized>(
+    fn do_search<S: Scorer + ?Sized, T: Collector, B: Bits + ?Sized>(
         scorer: &mut S,
         collector: &mut T,
         live_docs: &B,
+        next_limit: usize,
     ) -> Result<()> {
         let mut bulk_scorer = BulkScorer::new(scorer);
-        match bulk_scorer.score(collector, Some(live_docs), 0, NO_MORE_DOCS) {
+        match bulk_scorer.score(collector, Some(live_docs), 0, NO_MORE_DOCS, next_limit) {
             Err(Error(ErrorKind::Collector(collector::ErrorKind::CollectionTerminated), _)) => {
                 // Collection was terminated prematurely
                 Ok(())
@@ -264,6 +413,60 @@ where
                 Err(e)
             }
         }
+    }
+
+    // segregate leaf readers amongst multiple slices
+    fn slice(
+        mut leaves: Vec<LeafReaderContext<'_, C>>,
+        max_docs_per_slice: i32,
+        max_segments_per_slice: i32,
+        min_parallel_slices: i32,
+    ) -> Vec<Vec<usize>> {
+        if leaves.is_empty() {
+            return vec![];
+        }
+
+        // reverse order by leaf reader max doc
+        leaves.sort_by(|l1, l2| l1.reader.max_doc().cmp(&l2.reader.max_doc()));
+
+        let mut slices = vec![];
+        let mut doc_sum = 0;
+        let mut ords = vec![];
+
+        if leaves.len() <= min_parallel_slices as usize {
+            for ctx in &leaves {
+                slices.push(vec![ctx.ord]);
+            }
+            return slices;
+        }
+
+        let mut total_docs = 0;
+        for ctx in &leaves {
+            total_docs += ctx.reader.max_doc();
+        }
+
+        let reserved = max_docs_per_slice.min(total_docs / min_parallel_slices);
+
+        for ctx in &leaves {
+            let max_doc = ctx.reader.max_doc();
+            if max_doc >= reserved {
+                slices.push(vec![ctx.ord]);
+            } else {
+                if doc_sum + max_doc > reserved || ords.len() >= max_segments_per_slice as usize {
+                    ords.sort();
+                    slices.push(ords);
+                    ords = vec![];
+                    doc_sum = 0;
+                }
+                ords.push(ctx.ord);
+                doc_sum += ctx.reader.max_doc();
+            }
+        }
+        if !ords.is_empty() {
+            ords.sort();
+            slices.push(ords);
+        }
+        slices
     }
 }
 
@@ -283,7 +486,7 @@ where
     /// Lower-level search API.
     fn search<S>(&self, query: &dyn Query<C>, collector: &mut S) -> Result<()>
     where
-        S: SearchCollector + ?Sized,
+        S: SearchCollector,
     {
         let weight = self.create_weight(query, collector.needs_scores())?;
 
@@ -301,7 +504,20 @@ where
                 }
                 let live_docs = reader.reader.live_docs();
 
-                Self::do_search(&mut *scorer, collector, live_docs.as_ref())?;
+                match Self::do_search(&mut *scorer, collector, live_docs.as_ref(), self.next_limit)
+                {
+                    Ok(()) => {}
+                    Err(Error(
+                        ErrorKind::Collector(collector::ErrorKind::CollectionTimeout),
+                        _,
+                    )) => {
+                        // Collection timeout, we must terminate the search
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
             }
         }
 
@@ -310,52 +526,105 @@ where
 
     fn search_parallel<S>(&self, query: &dyn Query<C>, collector: &mut S) -> Result<()>
     where
-        S: SearchCollector + ?Sized,
+        S: SearchCollector,
     {
-        if collector.support_parallel() && self.reader.leaves().len() > 1 {
-            if let Some(ref thread_pool) = self.thread_pool {
-                let weight = self.create_weight(query, collector.needs_scores())?;
+        if collector.support_parallel() && self.leaf_ord_slices.len() > 1 {
+            debug_assert!(self.thread_pool.is_some());
+            let thread_pool = self.thread_pool.as_ref().unwrap();
+            let weight = self.create_weight(query, collector.needs_scores())?;
+            let leaf_readers = self.reader.leaves();
 
-                for (_ord, reader) in self.reader.leaves().iter().enumerate() {
-                    if let Some(scorer) = weight.create_scorer(reader)? {
-                        match collector.leaf_collector(reader) {
-                            Ok(leaf_collector) => {
-                                let live_docs = reader.reader.live_docs();
-                                thread_pool.execute(move |_ctx| {
-                                    let mut collector = leaf_collector;
-                                    let mut scorer = scorer;
-                                    if let Err(e) = Self::do_search(
-                                        scorer.as_mut(),
-                                        &mut collector,
-                                        live_docs.as_ref(),
-                                    ) {
+            collector.init_parallel();
+
+            for leaf_slice in &self.leaf_ord_slices {
+                let mut scorer_and_collectors = vec![];
+
+                for ord in leaf_slice.iter() {
+                    let leaf_ctx = &leaf_readers[*ord];
+                    match collector.leaf_collector(leaf_ctx) {
+                        Ok(leaf_collector) => {
+                            let w = &weight as *const Box<dyn Weight<C>> as u64;
+                            let reader = unsafe { ::std::mem::transmute(leaf_ctx.reader) };
+                            let parent = unsafe { ::std::mem::transmute(leaf_ctx.parent) };
+                            let leaf_ctx_ptr = LeafReaderContextPtr::new(
+                                leaf_ctx.ord,
+                                leaf_ctx.doc_base,
+                                reader,
+                                parent,
+                            );
+                            scorer_and_collectors.push((w, leaf_ctx_ptr, leaf_collector));
+                        }
+                        Err(e) => {
+                            error!(
+                                "create leaf collector for leaf {} failed with '{:?}'",
+                                leaf_ctx.reader.name(),
+                                e
+                            );
+                        }
+                    }
+                }
+
+                if !scorer_and_collectors.is_empty() {
+                    let next_limit = self.next_limit;
+
+                    thread_pool.execute(move |_| {
+                        for (w, leaf_ctx_ptr, mut collector) in scorer_and_collectors {
+                            let weight = unsafe { &*(w as *const Box<dyn Weight<C>>) };
+                            let reader = unsafe { &(*leaf_ctx_ptr.reader) };
+                            let parent = unsafe { &(*leaf_ctx_ptr.parent) };
+                            let leaf_ctx = LeafReaderContext::new(
+                                parent,
+                                reader,
+                                leaf_ctx_ptr.ord,
+                                leaf_ctx_ptr.doc_base,
+                            );
+
+                            if let Some(mut scorer) =
+                                weight.create_scorer(&leaf_ctx).unwrap_or(None)
+                            {
+                                let live_docs = leaf_ctx.reader.live_docs();
+
+                                let should_terminate = match Self::do_search(
+                                    scorer.as_mut(),
+                                    &mut collector,
+                                    live_docs.as_ref(),
+                                    next_limit,
+                                ) {
+                                    Ok(()) => false,
+                                    Err(Error(
+                                        ErrorKind::Collector(
+                                            collector::ErrorKind::CollectionTimeout,
+                                        ),
+                                        _,
+                                    )) => {
+                                        // Collection timeout, we must terminate the search
+                                        true
+                                    }
+                                    Err(e) => {
                                         error!(
                                             "do search parallel failed by '{:?}', may return \
                                              partial result",
                                             e
                                         );
+                                        true
                                     }
-                                    if let Err(e) = collector.finish_leaf() {
-                                        error!(
-                                            "finish search parallel failed by '{:?}', may return \
-                                             partial result",
-                                            e
-                                        );
-                                    }
-                                })
-                            }
-                            Err(e) => {
-                                error!(
-                                    "create leaf collector for leaf {} failed with '{:?}'",
-                                    reader.reader.name(),
-                                    e
-                                );
+                                };
+                                if let Err(e) = collector.finish_leaf() {
+                                    error!(
+                                        "finish search parallel failed by '{:?}', may return \
+                                         partial result",
+                                        e
+                                    );
+                                }
+                                if should_terminate {
+                                    break;
+                                }
                             }
                         }
-                    }
+                    });
                 }
-                return collector.finish_parallel();
             }
+            return collector.finish_parallel();
         }
         self.search(query, collector)
     }
@@ -424,7 +693,8 @@ where
         needs_scores: bool,
     ) -> Result<Box<dyn Weight<C>>> {
         let mut weight = query.create_weight(self, needs_scores)?;
-        if !needs_scores {
+        // currently not to use query_cache.
+        if false && !needs_scores {
             weight = self
                 .query_cache
                 .do_cache(weight, Arc::clone(&self.cache_policy));
@@ -459,70 +729,45 @@ where
         }
     }
 
-    fn term_state(&self, term: &Term) -> Result<Arc<TermContext<CodecTermState<C>>>> {
-        let term_context: Arc<TermContext<CodecTermState<C>>>;
-        let mut builded = false;
-        let term_key = format!("{}_{}", term.field, term.text()?);
-        if self.term_contexts.read().unwrap().contains_key(&term_key) {
-            builded = true;
-        }
-
-        if builded {
-            term_context = Arc::clone(self.term_contexts.read().unwrap().get(&term_key).unwrap());
+    fn term_statistics(&self, term: &Term) -> Result<TermStatistics> {
+        let doc_base = if let Some(field_stat) = self.collection_statistics.get(&term.field) {
+            field_stat.doc_base
         } else {
-            let mut context = TermContext::new(&*self.reader);
-            context.build(&*self.reader, &term)?;
-            term_context = Arc::new(context);
-            if self.term_contexts.read().unwrap().len() < self.term_contexts_limit {
-                self.term_contexts
-                    .write()
-                    .unwrap()
-                    .insert(term_key.clone(), Arc::clone(&term_context));
-            }
+            return Ok(TermStatistics::new(
+                term.bytes.clone(),
+                self.reader.max_doc() as i64,
+                -1,
+            ));
         };
 
-        Ok(term_context)
-    }
+        let mut doc_freq = 0;
+        let mut total_term_freq = 0;
 
-    fn term_statistics(
-        &self,
-        term: Term,
-        context: &TermContext<CodecTermState<C>>,
-    ) -> TermStatistics {
-        TermStatistics::new(
-            term.bytes,
-            i64::from(context.doc_freq),
-            context.total_term_freq,
-        )
-    }
+        for leaf_reader in self.reader.leaves() {
+            if leaf_reader.doc_base() < doc_base {
+                continue;
+            } else if leaf_reader.doc_base() > doc_base {
+                break;
+            }
 
-    fn collections_statistics(&self, field: &str) -> Result<CollectionStatistics> {
-        {
-            let statistics = self.collection_statistics.read().unwrap();
-            if let Some(stat) = statistics.get(field) {
-                return Ok(stat.clone());
+            if let Some(terms) = leaf_reader.reader.terms(&term.field)? {
+                let mut terms_enum = terms.iterator()?;
+                if terms_enum.seek_exact(&term.bytes)? {
+                    doc_freq = terms_enum.doc_freq()?;
+                    total_term_freq = terms_enum.total_term_freq()?;
+                }
             }
         }
-        // slow path
-        let mut doc_count = 0i32;
-        let mut sum_total_term_freq = 0i64;
-        let mut sum_doc_freq = 0i64;
-        if let Some(terms) = get_terms(&*self.reader, field)? {
-            doc_count = terms.doc_count()?;
-            sum_total_term_freq = terms.sum_total_term_freq()?;
-            sum_doc_freq = terms.sum_doc_freq()?;
-        }
-        let stat = CollectionStatistics::new(
-            field.into(),
-            i64::from(self.reader.max_doc()),
-            i64::from(doc_count),
-            sum_total_term_freq,
-            sum_doc_freq,
-        );
 
-        let mut statistics = self.collection_statistics.write().unwrap();
-        statistics.insert(field.into(), stat);
-        Ok(statistics[field].clone())
+        Ok(TermStatistics::new(
+            term.bytes.clone(),
+            doc_freq as i64,
+            total_term_freq,
+        ))
+    }
+
+    fn collections_statistics(&self, field: &str) -> Option<&CollectionStatistics> {
+        self.collection_statistics.get(field)
     }
 }
 
@@ -554,13 +799,16 @@ impl SearchCollector for TotalHitCountCollector {
         true
     }
 
-    fn leaf_collector<C: Codec>(
-        &mut self,
-        _reader: &LeafReaderContext<'_, C>,
-    ) -> Result<TotalHitsCountLeafCollector> {
+    fn init_parallel(&mut self) {
         if self.channel.is_none() {
             self.channel = Some(unbounded());
         }
+    }
+
+    fn leaf_collector<C: Codec>(
+        &self,
+        _reader: &LeafReaderContext<'_, C>,
+    ) -> Result<TotalHitsCountLeafCollector> {
         Ok(TotalHitsCountLeafCollector {
             count: 0,
             sender: self.channel.as_ref().unwrap().0.clone(),
@@ -626,15 +874,10 @@ mod tests {
     use super::*;
     use core::codec::tests::TestCodec;
     use core::index::tests::*;
-    use core::search::collector::top_docs::*;
     use core::search::collector::*;
+    use core::search::query::TermQuery;
     use core::search::tests::*;
-    use core::search::TermQuery;
-    use core::search::*;
     use core::util::DocId;
-    use std::sync::atomic::Ordering;
-
-    pub const MOCK_QUERY: &str = "mock";
 
     struct MockQuery {
         docs: Vec<DocId>,
@@ -659,11 +902,7 @@ mod tests {
             unimplemented!()
         }
 
-        fn query_type(&self) -> &'static str {
-            MOCK_QUERY
-        }
-
-        fn as_any(&self) -> &::std::any::Any {
+        fn as_any(&self) -> &dyn (::std::any::Any) {
             unreachable!()
         }
     }
@@ -699,12 +938,7 @@ mod tests {
                 }
             }
 
-            assert_eq!(
-                early_terminating_collector
-                    .early_terminated
-                    .load(Ordering::Acquire),
-                true
-            );
+            assert_eq!(early_terminating_collector.early_terminated(), true);
         }
 
         let top_docs = top_collector.top_docs();

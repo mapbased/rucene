@@ -11,24 +11,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod top_docs;
+
+pub use self::top_docs::*;
+
+mod early_terminating;
+
+pub use self::early_terminating::*;
+
+mod timeout;
+
+pub use self::timeout::*;
+
+mod chain;
+
+pub use self::chain::*;
+
 use error::Result;
 
 use core::codec::Codec;
-use core::index::LeafReaderContext;
-use core::search::Scorer;
+use core::index::reader::LeafReaderContext;
+use core::search::scorer::Scorer;
 use core::util::DocId;
-
-pub mod top_docs;
-pub use self::top_docs::TopDocsCollector;
-
-mod early_terminating;
-pub use self::early_terminating::EarlyTerminatingSortingCollector;
-
-mod timeout;
-pub use self::timeout::TimeoutCollector;
-
-mod chain;
-pub use self::chain::ChainedCollector;
 
 error_chain! {
     types {
@@ -41,6 +45,10 @@ error_chain! {
         CollectionTerminated {
             description("Collection terminated")
         }
+        CollectionTimeout {
+            description("Collection timeout")
+        }
+
         CollectionFailed {
             description("Collection failed")
         }
@@ -73,9 +81,10 @@ pub trait SearchCollector: Collector {
 
     /// iff this collector support parallel collect
     fn support_parallel(&self) -> bool;
+    fn init_parallel(&mut self) {}
 
     /// segment collector for parallel search
-    fn leaf_collector<C: Codec>(&mut self, reader: &LeafReaderContext<'_, C>) -> Result<Self::LC>;
+    fn leaf_collector<C: Codec>(&self, reader: &LeafReaderContext<'_, C>) -> Result<Self::LC>;
 
     fn finish_parallel(&mut self) -> Result<()>;
 }
@@ -91,7 +100,11 @@ impl<'a, T: SearchCollector + 'a> SearchCollector for &'a mut T {
         (**self).support_parallel()
     }
 
-    fn leaf_collector<C: Codec>(&mut self, reader: &LeafReaderContext<'_, C>) -> Result<Self::LC> {
+    fn init_parallel(&mut self) {
+        (**self).init_parallel()
+    }
+
+    fn leaf_collector<C: Codec>(&self, reader: &LeafReaderContext<'_, C>) -> Result<Self::LC> {
         (**self).leaf_collector(reader)
     }
 
@@ -128,6 +141,10 @@ impl<'a, T: Collector + 'a> Collector for &'a mut T {
     }
 }
 
+/// `Collector` that collect parallel for a single segment.
+///
+/// once finished, the `finish_leaf` method must be
+/// called to notify to main thread.
 pub trait ParallelLeafCollector: Collector + Send + 'static {
     fn finish_leaf(&mut self) -> Result<()>;
 }

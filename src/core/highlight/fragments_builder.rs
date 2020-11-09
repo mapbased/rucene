@@ -16,12 +16,12 @@ use std::cmp::min;
 use std::collections::HashMap;
 
 use core::codec::Codec;
-use core::doc::StoredField;
+use core::doc::{Fieldable, StoredField};
 use core::highlight::{
     BoundaryScanner, DefaultEncoder, Encoder, FieldFragList, FragmentsBuilder,
     SimpleBoundaryScanner, SubInfo, Toffs, WeightedFragInfo,
 };
-use core::index::{Fieldable, IndexReader};
+use core::index::reader::IndexReader;
 use core::util::DocId;
 
 use error::Result;
@@ -52,7 +52,7 @@ impl BaseFragmentsBuilder {
 
     fn fields<C: Codec>(
         &self,
-        reader: &IndexReader<Codec = C>,
+        reader: &dyn IndexReader<Codec = C>,
         doc_id: DocId,
         field_name: &str,
     ) -> Result<Vec<StoredField>> {
@@ -78,7 +78,7 @@ impl BaseFragmentsBuilder {
             let mut field_end = 0i32;
 
             for field in fields {
-                let string_value = format!("{}", field.field.fields_data().unwrap());
+                let string_value = format!("{}", field.field.field_data().unwrap());
                 if string_value.is_empty() {
                     field_end += 1;
                     continue;
@@ -105,7 +105,7 @@ impl BaseFragmentsBuilder {
                 }
 
                 if frag_info.start_offset >= field_end
-                    || frag_info.sub_infos[0].terms_offsets[0].start_offset >= field_end
+                    || frag_info.sub_infos[0].term_offsets[0].start_offset >= field_end
                 {
                     continue;
                 }
@@ -130,7 +130,7 @@ impl BaseFragmentsBuilder {
                 for sub_info in &mut frag_info.sub_infos {
                     let mut toffs_list: Vec<Toffs> = vec![];
 
-                    for toffs in &mut sub_info.terms_offsets {
+                    for toffs in &mut sub_info.term_offsets {
                         if toffs.start_offset >= field_end {
                             // We've gone past this value so its not worth iterating any more.
                             break;
@@ -176,12 +176,12 @@ impl BaseFragmentsBuilder {
                         boost += sub_info.boost;
                     }
 
-                    let mut i = sub_info.terms_offsets.len();
+                    let mut i = sub_info.term_offsets.len();
                     while i > 0 {
-                        if sub_info.terms_offsets[i - 1].start_offset - 1
-                            == sub_info.terms_offsets[i - 1].end_offset
+                        if sub_info.term_offsets[i - 1].start_offset - 1
+                            == sub_info.term_offsets[i - 1].end_offset
                         {
-                            sub_info.terms_offsets.remove(i - 1);
+                            sub_info.term_offsets.remove(i - 1);
                         }
 
                         i -= 1;
@@ -190,7 +190,7 @@ impl BaseFragmentsBuilder {
 
                 let mut i = frag_info.sub_infos.len();
                 while i > 0 {
-                    if frag_info.sub_infos[i - 1].terms_offsets.is_empty() {
+                    if frag_info.sub_infos[i - 1].term_offsets.is_empty() {
                         frag_info.sub_infos.remove(i - 1);
                     }
 
@@ -227,7 +227,7 @@ impl BaseFragmentsBuilder {
         frag_info: &WeightedFragInfo,
         pre_tags: &[String],
         post_tags: &[String],
-        encoder: &Encoder,
+        encoder: &dyn Encoder,
     ) -> Result<String> {
         let mut fragment = String::from("");
         let s = frag_info.start_offset;
@@ -246,7 +246,7 @@ impl BaseFragmentsBuilder {
         let mut original: String;
         let mut src_index = 0;
         for sub_info in &frag_info.sub_infos {
-            for to in &sub_info.terms_offsets {
+            for to in &sub_info.term_offsets {
                 let offset_delta = if to.end_offset - modified_start_offset[0] > src_len {
                     to.end_offset - modified_start_offset[0] - src_len
                 } else {
@@ -299,8 +299,7 @@ impl BaseFragmentsBuilder {
     ) -> Result<String> {
         while (buffer.chars().count() as i32) < end_offset && index[0] < (values.len() as i32) {
             let i = index[0];
-            buffer
-                .push_str(format!("{}", values[i as usize].field.fields_data().unwrap()).as_str());
+            buffer.push_str(format!("{}", values[i as usize].field.field_data().unwrap()).as_str());
             index[0] += 1;
             buffer.push(self.multi_valued_separator);
         }
@@ -311,7 +310,12 @@ impl BaseFragmentsBuilder {
             buffer_len -= 1;
         }
 
+        let mut start_offset = start_offset;
         let eo = if buffer_len < end_offset {
+            if start_offset - (end_offset - buffer_len - 1) <= 0 {
+                start_offset = 0;
+            }
+
             buffer_len
         } else {
             self.boundary_scanner.find_end_offset(buffer, end_offset)
@@ -351,14 +355,14 @@ impl BaseFragmentsBuilder {
 impl FragmentsBuilder for BaseFragmentsBuilder {
     fn create_fragments<C: Codec>(
         &self,
-        reader: &IndexReader<Codec = C>,
+        reader: &dyn IndexReader<Codec = C>,
         doc_id: DocId,
         field_name: &str,
-        field_frag_list: &mut FieldFragList,
+        field_frag_list: &mut dyn FieldFragList,
         pre_tags: Option<&[String]>,
         post_tags: Option<&[String]>,
         max_num_fragments: Option<i32>,
-        encoder: Option<&Encoder>,
+        encoder: Option<&dyn Encoder>,
         score_ordered: Option<bool>,
     ) -> Result<Vec<String>> {
         let pre_tags = match pre_tags {

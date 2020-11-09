@@ -15,9 +15,10 @@ use std::sync::Arc;
 
 use core::search::{DocIterator, NO_MORE_DOCS};
 use core::util::bit_util::{self, UnsignedShift};
-use core::util::{Bits, BitsContext, BitsRef};
+use core::util::{Bits, BitsRef};
 
 use error::{ErrorKind, Result};
+use std::intrinsics::volatile_set_memory;
 
 pub trait ImmutableBitSet: Bits {
     /// Return the number of bits that are set.
@@ -32,7 +33,7 @@ pub trait ImmutableBitSet: Bits {
     /// `DocIdSetIterator#NO_MORE_DOCS` is returned if there are no more set bits.
     fn next_set_bit(&self, index: usize) -> i32;
 
-    fn assert_unpositioned(&self, iter: &DocIterator) -> Result<()> {
+    fn assert_unpositioned(&self, iter: &dyn DocIterator) -> Result<()> {
         if iter.doc_id() != -1 {
             bail!(ErrorKind::IllegalState(format!(
                 "This operation only works with an unpositioned iterator, got current position = \
@@ -41,6 +42,37 @@ pub trait ImmutableBitSet: Bits {
             )))
         }
         Ok(())
+    }
+}
+
+pub struct BitSetIterator<'a, S> {
+    bit_set: &'a S,
+    current: i32,
+}
+
+impl<'a, S: ImmutableBitSet> BitSetIterator<'a, S> {
+    pub fn new(bit_set: &'a S) -> Self {
+        Self {
+            bit_set,
+            current: -1,
+        }
+    }
+}
+
+impl<'a, S: ImmutableBitSet + 'a> Iterator for BitSetIterator<'a, S> {
+    type Item = i32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current + 1 >= self.bit_set.len() as i32 {
+            None
+        } else {
+            self.current = self.bit_set.next_set_bit((self.current + 1) as usize);
+            if self.current == NO_MORE_DOCS {
+                None
+            } else {
+                Some(self.current)
+            }
+        }
     }
 }
 
@@ -61,7 +93,7 @@ pub trait BitSet: ImmutableBitSet {
 
     /// Does in-place OR of the bits provided by the iterator. The state of the
     /// iterator after this operation terminates is undefined.
-    fn or(&mut self, iter: &mut DocIterator) -> Result<()> {
+    fn or(&mut self, iter: &mut dyn DocIterator) -> Result<()> {
         self.assert_unpositioned(iter)?;
         loop {
             let doc = iter.next()?;
@@ -158,6 +190,89 @@ impl FixedBitSet {
         }
     }
 
+    pub fn resize(&mut self, num_bits: usize) {
+        let num_words = bits2words(num_bits);
+        if num_words != self.bits.len() {
+            self.bits.resize(num_words, 0);
+            self.num_words = num_words;
+            self.num_bits = self.num_words << 6usize;
+        }
+    }
+
+    pub fn encode_size(&self) -> usize {
+        self.num_words << 3
+    }
+
+    pub fn count_ones_before_index2(
+        &self,
+        doc_upto: i32,
+        bit_index: usize,
+        end_index: usize,
+    ) -> u32 {
+        let mut count = doc_upto as u32;
+        if end_index > bit_index {
+            let mut start_high = bit_index >> 6;
+            let end_high = end_index >> 6;
+            if start_high < end_high {
+                let remain = self.bits[start_high] as usize >> (bit_index & 0x3F);
+                if remain != 0 {
+                    count += (remain as i64).count_ones();
+                }
+                start_high += 1;
+                for i in start_high..end_high {
+                    if self.bits[i] != 0 {
+                        count += self.bits[i].count_ones();
+                    }
+                }
+                let low_value = end_index & 0x3F;
+                if low_value > 0 {
+                    let value = self.bits[end_high] & ((1usize << low_value) - 1) as i64;
+                    if value > 0 {
+                        count += value.count_ones();
+                    }
+                }
+            } else {
+                let end_remain = end_index & 0x3F;
+                if end_remain > 0 {
+                    let value = self.bits[end_high] & ((1usize << end_remain) - 1) as i64;
+                    if value > 0 {
+                        let bit_remain = bit_index & 0x3F;
+                        let value = value >> bit_remain as i64;
+                        if value > 0 {
+                            count += value.count_ones();
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    pub fn count_ones_before_index(&self, end_index: usize) -> u32 {
+        let mut count = 0;
+        if end_index > 0 {
+            let index = end_index - 1;
+            let max = index >> 6;
+            for i in 0..max {
+                count += self.bits[i].count_ones();
+            }
+            let num_bits = (index & 0x3Fusize) + 1;
+            count += if num_bits == 64 {
+                self.bits[max].count_ones()
+            } else {
+                (self.bits[max] & ((1usize << num_bits) - 1) as i64).count_ones()
+            };
+        }
+        count
+    }
+
+    #[inline]
+    pub fn clear_all(&mut self) {
+        unsafe {
+            volatile_set_memory(self.bits.as_mut_ptr(), 0, self.bits.len());
+        }
+    }
+
     /// Checks if the bits past numBits are clear. Some methods rely on this implicit
     /// assumption: search for "Depends on the ghost bits being clear!"
     /// @return true if the bits past numBits are clear.
@@ -196,7 +311,7 @@ impl FixedBitSet {
         unsafe {
             let ptr = self.bits.as_mut_ptr();
             for i in start_word + 1..end_word {
-                let e = ptr.offset(i as isize);
+                let e = ptr.add(i);
                 *e = !*e;
             }
         }
@@ -238,7 +353,7 @@ impl ImmutableBitSet for FixedBitSet {
         debug_assert!(index < self.num_bits);
         let mut i = index >> 6;
         // skip all the bits to the right of index
-        let word = unsafe { *self.bits.as_ptr().offset(i as isize) } >> (index & 0x3fusize);
+        let word = unsafe { *self.bits.as_ptr().add(i) } >> (index & 0x3fusize);
 
         if word != 0 {
             return (index as u32 + word.trailing_zeros()) as i32;
@@ -251,7 +366,7 @@ impl ImmutableBitSet for FixedBitSet {
                 if i >= self.num_words {
                     break;
                 }
-                let word = *bits_ptr.offset(i as isize);
+                let word = *bits_ptr.add(i);
                 if word != 0 {
                     return ((i << 6) as u32 + word.trailing_zeros()) as i32;
                 }
@@ -268,7 +383,7 @@ impl BitSet for FixedBitSet {
         let word_num = index >> 6;
         let mask = 1i64 << (index & 0x3fusize);
         unsafe {
-            *self.bits.as_mut_ptr().offset(word_num as isize) |= mask;
+            *self.bits.as_mut_ptr().add(word_num) |= mask;
         }
     }
 
@@ -304,7 +419,7 @@ impl BitSet for FixedBitSet {
     }
 
     fn clear_batch(&mut self, start_index: usize, end_index: usize) {
-        debug_assert!(start_index < self.num_bits);
+        debug_assert!(start_index <= self.num_bits);
         debug_assert!(end_index <= self.num_bits);
         if end_index <= start_index {
             return;
@@ -335,31 +450,28 @@ impl BitSet for FixedBitSet {
 
 impl Bits for FixedBitSet {
     #[inline]
-    fn get_with_ctx(&self, ctx: BitsContext, index: usize) -> Result<(bool, BitsContext)> {
+    fn get(&self, index: usize) -> Result<bool> {
         debug_assert!(index < self.num_bits);
         let i = index >> 6; // div 64
                             // signed shift will keep a negative index and force an
                             // array-index-out-of-bounds-exception, removing the need for an explicit check.
         let mask = 1i64 << (index & 0x3fusize);
-        Ok((
-            unsafe { *self.bits.as_ptr().offset(i as isize) & mask != 0 },
-            ctx,
-        ))
+        Ok(unsafe { *self.bits.as_ptr().add(i) & mask != 0 })
     }
 
     fn len(&self) -> usize {
         self.num_bits
     }
 
-    fn as_bit_set(&self) -> &BitSet {
+    fn as_bit_set(&self) -> &dyn BitSet {
         self
     }
 
-    fn as_bit_set_mut(&mut self) -> &mut BitSet {
+    fn as_bit_set_mut(&mut self) -> &mut dyn BitSet {
         self
     }
 
-    fn clone(&self) -> BitsRef {
+    fn clone_box(&self) -> BitsRef {
         Arc::new(Self::copy_from(self.bits.clone(), self.num_bits).unwrap())
     }
 }

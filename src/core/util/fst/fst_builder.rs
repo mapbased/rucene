@@ -22,8 +22,8 @@ use core::util::fst::bytes_store::StoreBytesReader;
 use core::util::fst::fst_reader::{CompiledAddress, InputType};
 use core::util::fst::{BytesReader, Output, OutputFactory, FST};
 use core::util::ints_ref::{IntsRef, IntsRefBuilder};
+use core::util::packed::COMPACT;
 use core::util::packed::{PagedGrowableWriter, PagedMutableWriter};
-use core::util::packed_misc::COMPACT;
 use core::util::LongValues;
 
 use error::Result;
@@ -598,7 +598,7 @@ impl<F: OutputFactory> NodeHash<F> {
         h
     }
 
-    fn node_hash_compiled(&self, n: CompiledAddress, input: &mut BytesReader) -> Result<u64> {
+    fn node_hash_compiled(&self, n: CompiledAddress, input: &mut dyn BytesReader) -> Result<u64> {
         let prime = 31u64;
         let mut h = 0u64;
         let mut arc = self.fst().read_first_real_arc(n, input)?;
@@ -607,7 +607,7 @@ impl<F: OutputFactory> NodeHash<F> {
             if arc.target != 0 {
                 h = prime
                     .wrapping_mul(h)
-                    .wrapping_add((arc.target ^ (arc.target >> 32)) as u64);;
+                    .wrapping_add((arc.target ^ (arc.target >> 32)) as u64);
             }
             if let Some(ref output) = arc.output {
                 h = prime.wrapping_mul(h).wrapping_add(self.hash_code(output));
@@ -626,7 +626,7 @@ impl<F: OutputFactory> NodeHash<F> {
         Ok(h)
     }
 
-    pub fn add(&mut self, builder: &mut FstBuilder<F>, node_index: usize) -> Result<(u64)> {
+    pub fn add(&mut self, builder: &mut FstBuilder<F>, node_index: usize) -> Result<u64> {
         let h = self.node_hash_uncompiled(&builder.frontier[node_index]);
         let mut pos = h & self.mask as u64;
         let mut c = 0;
@@ -659,7 +659,7 @@ impl<F: OutputFactory> NodeHash<F> {
         }
     }
 
-    fn rehash(&mut self, input: &mut BytesReader) -> Result<()> {
+    fn rehash(&mut self, input: &mut dyn BytesReader) -> Result<()> {
         let old_size = self.table.size();
         let new_table = PagedGrowableWriter::new(
             2 * old_size,
@@ -680,7 +680,7 @@ impl<F: OutputFactory> NodeHash<F> {
     }
 
     // called only by rehash
-    fn add_new(&mut self, address: i64, input: &mut BytesReader) -> Result<()> {
+    fn add_new(&mut self, address: i64, input: &mut dyn BytesReader) -> Result<()> {
         let hash = self.node_hash_compiled(address, input)? as usize;
         let mut pos = hash & self.mask;
         let mut c = 0;

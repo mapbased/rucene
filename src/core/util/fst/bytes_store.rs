@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::store::{DataInput, DataOutput, IndexInput, RandomAccessInput};
+use core::store::io::{DataInput, DataOutput, IndexInput, RandomAccessInput};
 use core::util::fst::BytesReader;
 
 use error::{ErrorKind, Result};
@@ -64,7 +64,7 @@ impl BytesStore {
         while left > 0 {
             let chunk = min(block_size, left);
             let mut block = vec![0; chunk];
-            input.read_bytes(block.as_mut_slice(), 0, chunk)?;
+            input.read_exact(block.as_mut_slice())?;
             blocks.push(block);
 
             if left >= chunk {
@@ -94,6 +94,18 @@ impl BytesStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    #[inline(always)]
+    fn write_bytes_unchecked(&mut self, idx: usize, bytes: &[u8]) {
+        let cur_block = &mut self.blocks[idx];
+        debug_assert!(cur_block.capacity() - cur_block.len() >= bytes.len());
+        let start = cur_block.len();
+        let end = start + bytes.len();
+        unsafe {
+            cur_block.set_len(end);
+        }
+        cur_block[start..end].copy_from_slice(bytes);
+    }
 }
 
 impl DataOutput for BytesStore {}
@@ -113,12 +125,12 @@ impl Write for BytesStore {
             let idx = self.current_index as usize;
             let chunk = self.block_size - self.blocks[idx].len();
             if len <= chunk {
-                self.blocks[idx].extend(buf[offset..offset + len].iter());
+                self.write_bytes_unchecked(idx, &buf[offset..offset + len]);
                 offset += len;
                 break;
             } else {
                 if chunk > 0 {
-                    self.blocks[idx].extend(buf[offset..offset + chunk].iter());
+                    self.write_bytes_unchecked(idx, &buf[offset..offset + chunk]);
                     offset += chunk;
                     len -= chunk;
                 }
@@ -291,9 +303,10 @@ impl BytesStore {
         let limit = (dest_pos - src_pos + 1) / 2;
 
         for _ in 0..limit {
-            let b = self.blocks[src_block_index][src];
+            let tmp = self.blocks[src_block_index][src];
             self.blocks[src_block_index][src] = self.blocks[dest_block_index][dest];
-            self.blocks[dest_block_index][dest] = b;
+            self.blocks[dest_block_index][dest] = tmp;
+
             src += 1;
             if src == self.block_size {
                 src_block_index += 1;
@@ -433,9 +446,19 @@ impl StoreBytesReader {
             reversed,
         }
     }
+
+    #[inline]
+    fn remain(&mut self) -> usize {
+        if self.reversed {
+            self.position() + 1
+        } else {
+            self.length - self.position()
+        }
+    }
 }
 
 impl BytesReader for StoreBytesReader {
+    #[inline]
     fn position(&self) -> usize {
         self.block_index * self.block_size + self.next_read
     }
@@ -454,11 +477,9 @@ impl BytesReader for StoreBytesReader {
 impl DataInput for StoreBytesReader {
     fn read_byte(&mut self) -> Result<u8> {
         let b = unsafe {
-            *(*((*self.blocks.as_ref())
+            *(*((*self.blocks.as_ref()).as_ptr().add(self.block_index)))
                 .as_ptr()
-                .offset(self.block_index as isize)))
-            .as_ptr()
-            .offset(self.next_read as isize)
+                .add(self.next_read)
         };
 
         if self.reversed {
@@ -484,9 +505,9 @@ impl DataInput for StoreBytesReader {
 
     fn read_bytes(&mut self, b: &mut [u8], offset: usize, len: usize) -> Result<()> {
         unsafe {
-            let ptr = b.as_mut_ptr().offset(offset as isize);
+            let ptr = b.as_mut_ptr().add(offset);
             for i in 0..len {
-                *ptr.offset(i as isize) = self.read_byte()?;
+                *ptr.add(i) = self.read_byte()?;
             }
         }
 
@@ -542,16 +563,47 @@ impl IndexInput for StoreBytesReader {
 }
 
 impl Read for StoreBytesReader {
-    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
-        let left = b.len();
-
-        for i in b.iter_mut().take(left) {
-            if let Ok(byte) = self.read_byte() {
-                *i = byte;
+    fn read(&mut self, mut b: &mut [u8]) -> io::Result<usize> {
+        let total = b.len().min(self.remain());
+        let mut left = total;
+        while left > 0 {
+            if self.reversed {
+                let cur_buf = &self.blocks.as_ref()[self.block_index];
+                let len = (self.next_read + 1).min(left);
+                let start = self.next_read + 1 - len;
+                cur_buf[start..start + len]
+                    .iter()
+                    .rev()
+                    .zip(&mut b[..len])
+                    .for_each(|(s, d)| *d = *s);
+                b = &mut b[len..];
+                left -= len;
+                if self.next_read < len {
+                    // XXX: compatible with current code, don't coredump when block_index=0
+                    if self.block_index == 0 {
+                        self.block_index = usize::max_value();
+                    } else {
+                        self.block_index -= 1;
+                    }
+                    self.next_read = self.block_size - 1;
+                } else {
+                    self.next_read -= len;
+                }
+            } else {
+                let cur_buf = &self.blocks.as_ref()[self.block_index];
+                let len = left.min(cur_buf.len() - self.next_read);
+                b[..len].copy_from_slice(&cur_buf[self.next_read..self.next_read + len]);
+                b = &mut b[len..];
+                self.next_read += len;
+                if self.next_read == self.block_size {
+                    self.block_index += 1;
+                    self.next_read = 0;
+                }
+                left -= len;
             }
         }
 
-        Ok(b.len() - left)
+        Ok(total)
     }
 }
 

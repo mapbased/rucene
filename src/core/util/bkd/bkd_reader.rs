@@ -11,9 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::codec::codec_util;
-use core::index::{DocMap, IntersectVisitor, LiveDocsDocMap, Relation};
-use core::store::{ByteArrayDataInput, ByteArrayRef, DataInput, IndexInput};
+use core::codec::check_header;
+use core::codec::points::{IntersectVisitor, Relation};
+use core::index::merge::{DocMap, LiveDocsDocMap};
+use core::store::io::{ByteArrayDataInput, ByteArrayRef, DataInput, IndexInput};
 use core::util::bkd::DocIdsWriter;
 use core::util::bkd::{
     BKD_CODEC_NAME, BKD_VERSION_COMPRESSED_DOC_IDS, BKD_VERSION_COMPRESSED_VALUES,
@@ -90,7 +91,7 @@ pub struct BKDReader {
 impl BKDReader {
     pub fn new(input: Arc<dyn IndexInput>) -> Result<BKDReader> {
         let mut reader: Box<dyn IndexInput> = input.as_ref().clone()?;
-        let version = codec_util::check_header(
+        let version = check_header(
             reader.as_mut(),
             BKD_CODEC_NAME,
             BKD_VERSION_START,
@@ -114,8 +115,8 @@ impl BKDReader {
 
         let mut min_packed_value = vec![0u8; packed_bytes_length];
         let mut max_packed_value = vec![0u8; packed_bytes_length];
-        reader.read_bytes(&mut min_packed_value, 0, packed_bytes_length)?;
-        reader.read_bytes(&mut max_packed_value, 0, packed_bytes_length)?;
+        reader.read_exact(&mut min_packed_value)?;
+        reader.read_exact(&mut max_packed_value)?;
 
         for dim in 0..num_dims {
             let start = dim * bytes_per_dim;
@@ -137,12 +138,12 @@ impl BKDReader {
         if version >= BKD_VERSION_PACKED_INDEX {
             let num_bytes = reader.read_vint()? as usize;
             packed_index.resize(num_bytes, 0u8);
-            reader.read_bytes(&mut packed_index, 0, num_bytes)?;
+            reader.read_exact(&mut packed_index)?;
         } else {
             // legacy un-packed index
             let length = bytes_per_index_entry * num_leaves;
             split_packed_values.resize(length, 0u8);
-            reader.read_bytes(&mut split_packed_values, 0, length)?;
+            reader.read_exact(&mut split_packed_values)?;
 
             // Read the file pointers to the start of each leaf block:
             leaf_block_fps.resize(num_leaves, 0i64);
@@ -1299,7 +1300,7 @@ impl<'a, IV: IntersectVisitor + 'a> IntersectVisitor for MergeIntersectVisitor<'
 }
 
 #[derive(Default, Clone)]
-pub(crate) struct StubIntersectVisitor {}
+pub struct StubIntersectVisitor {}
 
 impl IntersectVisitor for StubIntersectVisitor {
     fn visit(&mut self, _doc_id: i32) -> Result<()> {
